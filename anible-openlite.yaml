@@ -1,0 +1,214 @@
+---
+- name: Deploy Django app with OpenLiteSpeed
+  hosts: app_server
+  become: yes
+  become_user: ubuntu
+  vars:
+    repo_destination: '/var/www/ncsjobsbe'
+    domain_name: 'app1.niranaya.com'
+    postgres_db: 'ncs_db'
+    postgres_user: 'ncs_user'
+    postgres_password: 'YCvsQRqgt5EOCGrGxK'
+
+  tasks:
+    - name: Clone the Git repository on the remote server
+      git:
+        repo: git@github.com:ncs-niranjan/ncsjobsbe.git
+        dest: "{{ repo_destination }}"
+        version: dev
+        accept_hostkey: yes
+        key_file: "~/.ssh/eddeploy"
+      register: clone_repo
+      ignore_errors: yes
+
+    - name: Pull the latest changes from the Git repository
+      git:
+        repo: "git@github.com:ncs-niranjan/ncsjobsbe.git"
+        dest: "{{ repo_destination }}"
+        version: dev
+        accept_hostkey: yes
+        key_file: "~/.ssh/eddeploy"
+      register: pull_repo
+      ignore_errors: yes
+
+    - name: Install OpenLiteSpeed and necessary components
+      apt:
+        name: "{{ item }}"
+        state: present
+      with_items:
+        - openlitespeed
+
+    - name: Configure OpenLiteSpeed using a Jinja2 template
+      template:
+        src: templates/vconfig.conf.j2
+        dest: "/etc/openlitespeed/vhosts/{{ domain_name }}.conf"
+      vars:
+        docRoot: "{{ repo_destination }}/ncsjobsbe"
+        vhDomain: "{{ domain_name }}"
+        vhAliases: "www.{{ domain_name }}"
+
+    - name: Install PostgreSQL and necessary components
+      apt:
+        name: "{{ item }}"
+        state: present
+      with_items:
+        - python3-venv
+        - python3-dev
+        - libpq-dev
+        - postgresql
+        - postgresql-contrib
+
+    - name: Configure PostgreSQL to allow remote connections
+      lineinfile:
+        path: "/etc/postgresql/{{ item }}/main/pg_hba.conf"
+        line: "host all all 0.0.0.0/0 md5"
+        state: present
+      with_items:
+        - 12
+        - 13
+        - 14
+        # Add more PostgreSQL versions if required
+      notify: Restart PostgreSQL
+
+    - name: Create PostgreSQL database and user
+      become_user: postgres
+      postgresql_db:
+        name: "{{ postgres_db }}"
+        state: present
+      become: yes
+
+    - name: Create PostgreSQL user
+      become_user: postgres
+      postgresql_user:
+        name: "{{ postgres_user }}"
+        password: "{{ postgres_password }}"
+        state: present
+      become: yes
+
+    - name: Grant privileges on PostgreSQL database to the user
+      become_user: postgres
+      postgresql_privs:
+        database: "{{ postgres_db }}"
+        user: "{{ postgres_user }}"
+        priv: ALL
+        state: present
+      become: yes
+
+    - name: Create virtual environment and install required Python packages
+      command: python3 -m venv "{{ repo_destination }}/myprojectenv"
+      args:
+        creates: "{{ repo_destination }}/myprojectenv/bin/activate"
+      environment:
+        PATH: "{{ ansible_env.PATH }}:{{ repo_destination }}/myprojectenv/bin"
+      register: venv_result
+      changed_when: venv_result.rc != 0
+
+    - name: Upgrade pip and setuptools in the virtual environment
+      pip:
+        name: "{{ item }}"
+        virtualenv: "{{ repo_destination }}/myprojectenv"
+        state: latest
+      with_items:
+        - pip
+        - setuptools
+
+    - name: Install Python packages from requirements.txt
+      pip:
+        requirements: "{{ repo_destination }}/ncsjobsbe/requirements.txt"
+        virtualenv: "{{ repo_destination }}/myprojectenv"
+
+    - name: Render the settings.py template file using Jinja2
+      template:
+        src: /home/kali/openlitespeed/templates/settings.py.j2
+        dest: "{{ repo_destination }}/ncsjobsbe/niranaya/settings.py"
+      vars:
+        ALLOWED_HOSTS:
+          - '72.96.190.123'
+          - 'ncsapp.in'
+          - "www.{{ domain_name }}"
+        BASE_URL: "https://{{ domain_name }}"
+        CSRF_TRUSTED_ORIGINS:
+          - "https://{{ domain_name }}"
+        DATABASES:
+          default:
+            ENGINE: 'django.db.backends.postgresql'
+            NAME: "{{ postgres_db }}"
+            USER: "{{ postgres_user }}"
+            PASSWORD: "{{ postgres_password }}"
+            HOST: 'localhost'
+            PORT: '5432'
+
+    - name: Migrate the database and collect static files
+      command: python "{{ repo_destination }}/ncsjobsbe/manage.py" migrate
+      environment:
+        PATH: "{{ ansible_env.PATH }}:{{ repo_destination }}/myprojectenv/bin"
+      args:
+        chdir: "{{ repo_destination }}/ncsjobsbe"
+      register: migrate_result
+      changed_when: migrate_result.rc != 0
+
+    - name: Collect static files
+      command: python "{{ repo_destination }}/ncsjobsbe/manage.py" collectstatic --noinput
+      environment:
+        PATH: "{{ ansible_env.PATH }}:{{ repo_destination }}/myprojectenv/bin"
+      args:
+        chdir: "{{ repo_destination }}/ncsjobsbe"
+      register: collectstatic_result
+      changed_when: collectstatic_result.rc != 0
+
+    - name: Install additional Python packages
+      pip:
+        name:
+          - djangorestframework
+          - djangorestframework-simplejwt
+          - django-cors-headers
+          - django-filter
+          - razorpay
+          - Pillow
+          - whitenoise
+        virtualenv: "{{ repo_destination }}/myprojectenv"
+
+    - name: Install Certbot on the server
+      apt:
+        name: "{{ item }}"
+        state: present
+      with_items:
+        - software-properties-common
+        - python3-certbot-nginx
+
+    - name: Obtain and install SSL certificates using Certbot
+      command: certbot certonly --non-interactive --agree-tos --webroot -w "{{ repo_destination }}/ncsjobsbe" -d "{{ domain_name }}"
+      register: certbot_result
+      changed_when: certbot_result.rc != 0
+
+    - name: Configure OpenLiteSpeed to use SSL
+      file:
+        src: "/etc/letsencrypt/live/{{ domain_name }}/fullchain.pem"
+        dest: "/usr/local/lsws/conf/vhosts/{{ domain_name }}/cert.pem"
+        state: link
+
+    - name: Configure OpenLiteSpeed private key for SSL
+      file:
+        src: "/etc/letsencrypt/live/{{ domain_name }}/privkey.pem"
+        dest: "/usr/local/lsws/conf/vhosts/{{ domain_name }}/privkey.pem"
+        state: link
+
+    - name: Restart OpenLiteSpeed web server
+      service:
+        name: lsws
+        state: restarted
+
+  handlers:
+    - name: Restart PostgreSQL
+      become_user: postgres
+      systemd:
+        name: postgresql
+        state: restarted
+      become: yes
+
+    - name: Reload OpenLiteSpeed web server
+      service:
+        name: lsws
+        state: reloaded
+
+    
