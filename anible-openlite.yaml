@@ -5,15 +5,15 @@
   become_user: ubuntu
   vars:
     repo_destination: '/var/www/ncsjobsbe'
-    domain_name: 'app1.niranaya.com'
+    domain_name: ''
     postgres_db: 'ncs_db'
     postgres_user: 'ncs_user'
-    postgres_password: 'YCvsQRqgt5EOCGrGxK'
+    postgres_password: ''
 
   tasks:
     - name: Clone the Git repository on the remote server
       git:
-        repo: git@github.com:ncs-niranjan/ncsjobsbe.git
+        repo: git@github.com:
         dest: "{{ repo_destination }}"
         version: dev
         accept_hostkey: yes
@@ -23,7 +23,7 @@
 
     - name: Pull the latest changes from the Git repository
       git:
-        repo: "git@github.com:ncs-niranjan/ncsjobsbe.git"
+        repo: ""
         dest: "{{ repo_destination }}"
         version: dev
         accept_hostkey: yes
